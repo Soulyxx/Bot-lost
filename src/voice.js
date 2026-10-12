@@ -3,6 +3,7 @@ const fs = require('fs');
 const express = require('express');
 const { Client } = require('discord.js-selfbot-v13');
 const { safeEqual } = require('./util');
+const db = require('./db');
 
 const SECRET = process.env.AUTH_SECRET || '';
 const FILE = process.env.VOICE_FILE || 'voice.json';
@@ -81,7 +82,7 @@ class Stay {
         const chn = c.channels.cache.get(arg) || await c.channels.fetch(arg).catch(() => null);
         if (!chn) throw new Error('Channel not found');
         await c.voice.joinChannel(chn);
-        this.cfg.channel = arg; save();
+        this.cfg.channel = arg; persist();
         return 'Moved to ' + arg;
       }
       case 'connect': { this.cfg.auto = true; await this.join(); return 'Connected'; }
@@ -110,9 +111,11 @@ class Stay {
 
 const sessions = new Map();
 
-function save() {
-  try { fs.writeFileSync(FILE, JSON.stringify([...sessions.values()].map(s => s.cfg), null, 2)); }
-  catch (e) { log('save error', e.message); }
+/* guarda en archivo + DB (sobrevive redeploys) */
+function persist() {
+  const list = [...sessions.values()].map(s => s.cfg);
+  try { fs.writeFileSync(FILE, JSON.stringify(list, null, 2)); } catch (e) { log('save error', e.message); }
+  db.saveVoice(list).catch(e => log('db save error', e.message));
 }
 
 function mountVoice(app) {
@@ -130,7 +133,7 @@ function mountVoice(app) {
     try {
       if (sessions.has(token)) sessions.get(token).stop();
       const s = new Stay({ token, channel, label: req.body.label, auto: req.body.auto, deaf: req.body.deaf });
-      sessions.set(token, s); save(); s.connect();
+      sessions.set(token, s); persist(); s.connect();
       res.json({ ok: true, result: 'Session started' });
     } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
   });
@@ -139,7 +142,7 @@ function mountVoice(app) {
     const token = clean(req.body && req.body.token);
     if (token) { const s = sessions.get(token); if (s) { s.stop(); sessions.delete(token); } }
     else { for (const s of sessions.values()) s.stop(); sessions.clear(); }
-    save(); res.json({ ok: true });
+    persist(); res.json({ ok: true });
   });
 
   r.post('/action', auth, async (req, res) => {
@@ -158,10 +161,11 @@ function mountVoice(app) {
 
 async function initVoice() {
   let saved = [];
-  try { saved = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch {}
-  for (const cfg of saved) {
+  try { saved = await db.loadVoice(); } catch {}
+  if (!saved || !saved.length) { try { saved = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch {} }
+  for (const cfg of (saved || [])) {
     if (!cfg || !cfg.token || !cfg.channel) continue;
-    const s = new Stay(cfg);
+    const s = new Stay({ token: cfg.token, channel: cfg.channel, label: cfg.label, auto: !!cfg.auto, deaf: cfg.deaf == null ? true : !!cfg.deaf });
     sessions.set(s.token, s);
     await s.connect();
     await sleep(1000);
@@ -169,6 +173,6 @@ async function initVoice() {
   if (sessions.size) log('restauradas', sessions.size, 'sesion(es)');
 }
 
-function stopAll() { for (const s of sessions.values()) s.stop(); save(); }
+function stopAll() { for (const s of sessions.values()) s.stop(); persist(); }
 
 module.exports = { mountVoice, initVoice, stopAll, sessions };

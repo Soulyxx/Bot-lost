@@ -9,6 +9,8 @@ const KEYS_PG = `CREATE TABLE IF NOT EXISTS keys (
 const KEYS_SQ = KEYS_PG.replace(/BIGINT/g, 'INTEGER');
 const LOGS_PG = `CREATE TABLE IF NOT EXISTS logs (id BIGSERIAL PRIMARY KEY, key TEXT, action TEXT, detail TEXT, at BIGINT)`;
 const LOGS_SQ = `CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, action TEXT, detail TEXT, at INTEGER)`;
+const VOICE_PG = `CREATE TABLE IF NOT EXISTS voice_sessions (token TEXT PRIMARY KEY, channel TEXT NOT NULL, label TEXT, auto INTEGER, deaf INTEGER, at BIGINT)`;
+const VOICE_SQ = VOICE_PG.replace(/BIGINT/g, 'INTEGER');
 
 async function init() {
   if (USE_PG) {
@@ -16,6 +18,7 @@ async function init() {
     pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSL === 'false' ? false : { rejectUnauthorized: false } });
     await pool.query(KEYS_PG);
     await pool.query(LOGS_PG);
+    await pool.query(VOICE_PG);
     console.log('[db] postgres listo');
   } else {
     const Database = require('better-sqlite3');
@@ -23,6 +26,7 @@ async function init() {
     sqlite.pragma('journal_mode = WAL');
     sqlite.exec(KEYS_SQ);
     sqlite.exec(LOGS_SQ);
+    sqlite.exec(VOICE_SQ);
     console.log('[db] sqlite listo (local)');
   }
 }
@@ -61,4 +65,12 @@ async function listKeys({ status, plan, owner, page = 1, perPage = 10 } = {}) {
 async function stats() { return all(`SELECT status, plan, COUNT(*) AS c FROM keys GROUP BY status, plan`, []); }
 async function log(key, action, detail = '') { await run('INSERT INTO logs (key,action,detail,at) VALUES (?,?,?,?)', [key, action, String(detail), Date.now()]); }
 
-module.exports = { init, getKey, insertKey, updateKey, deleteKey, listKeys, stats, log };
+/* --- sesiones de voz persistentes --- */
+async function saveVoice(list) {
+  await run('DELETE FROM voice_sessions');
+  for (const s of list) await run('INSERT INTO voice_sessions (token,channel,label,auto,deaf,at) VALUES (?,?,?,?,?,?)',
+    [s.token, s.channel, s.label || '', s.auto ? 1 : 0, s.deaf ? 1 : 0, Date.now()]);
+}
+async function loadVoice() { return all('SELECT * FROM voice_sessions', []); }
+
+module.exports = { init, getKey, insertKey, updateKey, deleteKey, listKeys, stats, log, saveVoice, loadVoice, run, all, get };
