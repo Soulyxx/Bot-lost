@@ -2,6 +2,7 @@
 const express = require('express');
 const { validate } = require('./auth');
 const { safeEqual } = require('./util');
+const { mountVoice } = require('./voice');
 
 const SECRET = process.env.AUTH_SECRET || '';
 const hits = new Map();
@@ -30,6 +31,8 @@ function startApi() {
       res.json(await validate({ key, hwid, user, host, version, ip }));
     } catch { res.json({ ok: false, error: 'Server error' }); }
   });
+
+  mountVoice(app);
 
   const port = process.env.PORT || 3000;
   app.listen(port, () => console.log('[api] escuchando en ' + port));
