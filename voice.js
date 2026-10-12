@@ -12,13 +12,17 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log = (...a) => console.log('[voice]', ...a);
 const clean = v => String(v == null ? '' : v).trim().replace(/^["'`]+|["'`]+$/g, '').replace(/^Bearer\s+/i, '').trim();
 
+const roomOf = req => {
+  const h = req.headers['x-lost-room'];
+  const b = req.body && req.body.room;
+  return String(b || (h ? decodeURIComponent(h) : '') || 'default').trim() || 'default';
+};
+const kkey = (room, token) => room + '|' + token;
+
 class Stay {
   constructor(cfg) {
-    this.cfg = { token: clean(cfg.token), channel: clean(cfg.channel), label: cfg.label || '', auto: cfg.auto !== false, deaf: cfg.deaf !== false };
-    this.client = null;
-    this.watch = null;
-    this.connecting = false;
-    this.dead = false;
+    this.cfg = { room: cfg.room || 'default', token: clean(cfg.token), channel: clean(cfg.channel), label: cfg.label || '', auto: cfg.auto !== false, deaf: cfg.deaf !== false };
+    this.client = null; this.watch = null; this.connecting = false; this.dead = false;
   }
   get token() { return this.cfg.token; }
   get name() { return this.cfg.label || (this.client && this.client.user ? this.client.user.username : this.cfg.token.slice(0, 6)); }
@@ -98,7 +102,7 @@ class Stay {
   info() {
     const u = this.client && this.client.user;
     const conn = this.connection();
-    return { token: this.cfg.token, id: u ? u.id : null, username: u ? u.username : this.name, avatar: u ? u.avatar : null, channel: this.cfg.channel, auto: this.cfg.auto, connected: !!conn, deaf: !!(conn && conn.selfDeaf), mute: !!(conn && conn.selfMute) };
+    return { room: this.cfg.room, token: this.cfg.token, id: u ? u.id : null, username: u ? u.username : this.name, avatar: u ? u.avatar : null, channel: this.cfg.channel, auto: this.cfg.auto, connected: !!conn, deaf: !!(conn && conn.selfDeaf), mute: !!(conn && conn.selfMute) };
   }
 
   stop() {
@@ -121,48 +125,54 @@ function mountVoice(app) {
   const r = express.Router();
   const auth = (req, res, next) => { if (SECRET && !safeEqual(req.headers['x-lost-secret'] || '', SECRET)) return res.status(401).json({ ok: false, error: 'Bad secret' }); next(); };
 
-  r.get('/health', (req, res) => res.json({ ok: true, count: sessions.size, uptime: Math.floor(process.uptime()) }));
+  r.get('/health', (req, res) => res.json({ ok: true, rooms: new Set([...sessions.values()].map(s => s.cfg.room)).size, count: sessions.size, uptime: Math.floor(process.uptime()) }));
 
-  r.get('/list', auth, (req, res) => res.json({ ok: true, sessions: [...sessions.values()].map(s => s.info()) }));
+  r.get('/list', auth, (req, res) => {
+    const room = roomOf(req);
+    res.json({ ok: true, room, roomed: true, sessions: [...sessions.values()].filter(s => s.cfg.room === room).map(s => s.info()) });
+  });
 
   r.post('/join', auth, async (req, res) => {
+    const room = roomOf(req);
     const token = clean(req.body && req.body.token);
     const channel = clean(req.body && req.body.channel);
     if (!token || !channel) return res.status(400).json({ ok: false, error: 'token and channel required' });
     try {
-      const ex = sessions.get(token);
-      // ya existe y está en el mismo canal -> NO recrear (no re-mete al vc)
+      const key = kkey(room, token);
+      const ex = sessions.get(key);
       if (ex && !ex.dead && ex.cfg.channel === channel && ex.client && ex.client.user) {
         if (req.body.auto != null) ex.cfg.auto = req.body.auto !== false;
         if (!ex.connection() && ex.cfg.auto) ex.join();
         return res.json({ ok: true, result: 'Already in voice', existed: true });
       }
       if (ex) ex.stop();
-      const s = new Stay({ token, channel, label: req.body.label, auto: req.body.auto, deaf: req.body.deaf });
-      sessions.set(token, s); persist(); s.connect();
+      const s = new Stay({ room, token, channel, label: req.body.label, auto: req.body.auto, deaf: req.body.deaf });
+      sessions.set(key, s); persist(); s.connect();
       res.json({ ok: true, result: 'Session started' });
     } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
   });
 
   r.post('/leave', auth, (req, res) => {
+    const room = roomOf(req);
     const token = clean(req.body && req.body.token);
-    if (token) { const s = sessions.get(token); if (s) { s.stop(); sessions.delete(token); } }
-    else { for (const s of sessions.values()) s.stop(); sessions.clear(); }
+    if (token) { const key = kkey(room, token); const s = sessions.get(key); if (s) { s.stop(); sessions.delete(key); } }
+    else { for (const [key, s] of [...sessions.entries()]) if (s.cfg.room === room) { s.stop(); sessions.delete(key); } }
     persist(); res.json({ ok: true });
   });
 
   r.post('/action', auth, async (req, res) => {
+    const room = roomOf(req);
     const token = clean(req.body && req.body.token);
     const action = (req.body && req.body.action) || '';
     const arg = (req.body && req.body.arg) || '';
-    const s = sessions.get(token);
+    const s = sessions.get(kkey(room, token));
     if (!s) return res.status(404).json({ ok: false, error: 'Session not found' });
     try { res.json({ ok: true, result: await s.action(action, arg) }); }
     catch (e) { res.status(500).json({ ok: false, error: e.message }); }
   });
 
   app.use('/voice', r);
-  log('rutas /voice montadas');
+  log('rutas /voice montadas (multi-room)');
 }
 
 async function initVoice() {
@@ -171,8 +181,8 @@ async function initVoice() {
   if (!saved || !saved.length) { try { saved = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch {} }
   for (const cfg of (saved || [])) {
     if (!cfg || !cfg.token || !cfg.channel) continue;
-    const s = new Stay({ token: cfg.token, channel: cfg.channel, label: cfg.label, auto: !!cfg.auto, deaf: cfg.deaf == null ? true : !!cfg.deaf });
-    sessions.set(s.token, s);
+    const s = new Stay({ room: cfg.room || 'default', token: cfg.token, channel: cfg.channel, label: cfg.label, auto: !!cfg.auto, deaf: cfg.deaf == null ? true : !!cfg.deaf });
+    sessions.set(kkey(s.cfg.room, s.token), s);
     await s.connect();
     await sleep(1000);
   }
